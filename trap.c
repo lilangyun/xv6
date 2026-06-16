@@ -14,6 +14,8 @@ extern uint vectors[];  // in vectors.S: array of 256 entry pointers
 struct spinlock tickslock;
 uint ticks;
 
+int mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm);
+
 void
 tvinit(void)
 {
@@ -46,16 +48,31 @@ trap(struct trapframe *tf)
     return;
   }
 
+  struct proc *p = myproc();
   switch(tf->trapno){
-  case T_IRQ0 + IRQ_TIMER:
+  case T_IRQ0 + IRQ_TIMER:{
     if(cpuid() == 0){
       acquire(&tickslock);
       ticks++;
       wakeup(&ticks);
       release(&tickslock);
     }
+    if(p != 0 && (tf->cs & 3) == 3){
+      p->alarmcount++;
+      if(p->alarmticks != 0 && p->alarmhandler !=0 && p->in_alarm == 0 && p->alarmcount >= p->alarmticks){
+        // Alarming now, can't be interrupted.
+        p->alarmcount = 0;
+        // 设置用户空间下的返回地址
+        tf->esp -= 4;
+        *((uint *)(tf->esp)) = tf->eip;
+        // 实现用户空间下的跳转操作
+        p->in_alarm = 1;
+        tf->eip = (uint)(p->alarmhandler);
+      }
+    }
     lapiceoi();
     break;
+  }
   case T_IRQ0 + IRQ_IDE:
     ideintr();
     lapiceoi();
@@ -77,6 +94,37 @@ trap(struct trapframe *tf)
             cpuid(), tf->cs, tf->eip);
     lapiceoi();
     break;
+
+  case T_PGFLT:{
+    uint a = PGROUNDDOWN(rcr2());
+    if(a >= p->sz){
+      // Handle error cases such as sbrk() arguments that are too large.
+      p->killed = 1;
+      cprintf("trap %d: invalid: 0x%d higher than memory.\n", tf->trapno, a);
+      break;
+    }
+    else if(a < PGROUNDDOWN(p->tf->esp)){
+      // Correctly handle faults on the invalid page below the stack.
+      p->killed = 1;
+      cprintf("trap %d: invalid: 0x%d lower than user stack.\n", tf->trapno, a);
+      break;
+    }
+    char *mem = kalloc();
+    if(mem == 0){
+      p->killed = 1;
+      cprintf("trap %d: kalloc out of memory.\n", tf->trapno);
+      break;
+    }
+    else{
+      memset(mem, 0, PGSIZE);
+      if(mappages(myproc()->pgdir, (char*)a, PGSIZE, V2P(mem), PTE_W|PTE_U) != 0){
+        kfree(mem);
+        p->killed = 1;
+        cprintf("trap %d: mappages failed.\n", tf->trapno);
+      }
+    }
+    break;
+  }
 
   //PAGEBREAK: 13
   default:
